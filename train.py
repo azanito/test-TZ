@@ -20,6 +20,7 @@ import logging
 import os
 
 import torch
+torch.cuda.empty_cache()  # free any pre-allocated CUDA memory before model load
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import (
@@ -84,10 +85,10 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Training hyper-parameters
-    parser.add_argument("--max_seq_length", type=int, default=512)
+    parser.add_argument("--max_seq_length", type=int, default=256)
     parser.add_argument("--num_train_epochs", type=int, default=2)
     parser.add_argument("--per_device_train_batch_size", type=int, default=1)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--warmup_steps", type=int, default=10)
 
@@ -147,6 +148,7 @@ def load_model_and_tokenizer(model_name: str):
         quantization_config=bnb_config,
         device_map="auto",
         trust_remote_code=True,
+        low_cpu_mem_usage=True,     # build model layer-by-layer → peak CPU RAM ~halved
     )
 
     # Allow tf32 for matmul — safe on Ampere+ and speeds up training slightly
@@ -229,6 +231,9 @@ def main() -> None:
     # ── Model & tokenizer ─────────────────────────────────────────────────────
     model, tokenizer = load_model_and_tokenizer(args.model_name)
     model = apply_lora(model, args)
+
+    # Explicitly enable gradient checkpointing after LoRA is applied
+    model.gradient_checkpointing_enable()
 
     # ── SFTConfig ─────────────────────────────────────────────────────────────
     # fp16=True  / bf16=False  → mandatory for T4 (Turing architecture)
