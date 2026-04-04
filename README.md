@@ -86,7 +86,61 @@ Alternative: `databricks/databricks-dolly-15k` — pass `--dataset databricks/da
 
 ---
 
-## Setup
+## Running in Google Colab
+
+### 1. Enable GPU runtime
+
+`Runtime → Change runtime type → T4 GPU`
+
+### 2. Clone the repository and run
+
+```python
+# Cell 1 — clone
+!git clone https://github.com/your-username/qlora-finetuning
+%cd qlora-finetuning
+
+# Cell 2 — install
+!pip install -r requirements.txt -q
+
+# Cell 3 — prepare data
+!python prepare_data.py
+
+# Cell 4 — train (1 epoch ≈ 30–45 min on T4)
+!python train.py --num_train_epochs 1
+
+# Cell 5 — evaluate
+!python evaluate.py
+```
+
+Or run everything at once with the included shell script:
+
+```python
+!bash run_colab.sh
+```
+
+### 3. (Optional) Log in to Hugging Face for gated models
+
+```python
+from huggingface_hub import notebook_login
+notebook_login()
+```
+
+### 4. (Optional) Enable WandB logging
+
+```python
+import wandb
+wandb.login()
+# then pass --use_wandb flag to train.py
+```
+
+> **T4 compatibility notes:**
+> - T4 (Turing architecture) does **not** support bf16 — the code explicitly sets `fp16=True, bf16=False`
+> - 4-bit NF4 quantisation keeps peak VRAM under 8 GB; full T4 headroom is 16 GB
+> - `gradient_checkpointing=True` is enabled by default to further reduce VRAM
+
+---
+
+## Setup (local GPU)
 
 ### 1. Clone & install
 
@@ -96,19 +150,13 @@ cd qlora-finetuning
 pip install -r requirements.txt
 ```
 
-### 2. (Colab only) Install bitsandbytes for CUDA
-
-```bash
-pip install bitsandbytes --upgrade
-```
-
-### 3. (Optional) Log in to Hugging Face for gated models
+### 2. (Optional) Log in to Hugging Face for gated models
 
 ```bash
 huggingface-cli login
 ```
 
-### 4. (Optional) Set up WandB
+### 3. (Optional) Set up WandB
 
 ```bash
 wandb login

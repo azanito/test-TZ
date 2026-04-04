@@ -8,7 +8,7 @@ Supports:
 
 Works on:
   - Google Colab T4 (16 GB VRAM) — use default settings
-  - Local GPU with ≥ 8 GB VRAM  — reduce batch_size / seq_length if needed
+  - Local GPU with ≥ 8 GB VRAM  — reduce --max_seq_length 256 if needed
 
 Usage:
     python train.py
@@ -117,36 +117,47 @@ def build_prompt(sample: dict) -> str:
 def load_model_and_tokenizer(model_name: str):
     """
     Load the base model in 4-bit NF4 (QLoRA) and its tokenizer.
-    `prepare_model_for_kbit_training` freezes base weights and casts
-    LayerNorm layers to float32 for stable training.
+
+    Key decisions:
+    - bnb_4bit_compute_dtype=torch.float16  → T4 does NOT support bf16;
+      using bf16 here causes "_amp_foreach_non_finite_check_and_unscale_cuda
+      not implemented for BFloat16" at the first optimizer step.
+    - prepare_model_for_kbit_training       → freezes base weights, upcasts
+      LayerNorm to fp32 for numerical stability.
+    - gradient_checkpointing is enabled later via SFTConfig to save VRAM.
     """
     logger.info(f"Loading tokenizer: {model_name}")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    # pad_token must exist for batched training
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    # Right-padding is required by SFTTrainer
+    # Right-padding required by SFTTrainer packing / collation
     tokenizer.padding_side = "right"
 
-    # 4-bit quantisation config (doubles quantisation saves ~25% VRAM)
+    # Explicitly fp16 compute dtype — never bf16 on T4
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",          # NF4 is optimal for normally-distributed weights
-        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,   # ← must be float16, not bfloat16
         bnb_4bit_use_double_quant=True,
     )
 
-    logger.info(f"Loading model in 4-bit: {model_name}")
+    logger.info(f"Loading model in 4-bit fp16: {model_name}")
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         quantization_config=bnb_config,
-        device_map="auto",          # automatically shard across available GPUs / CPU
+        device_map="auto",
         trust_remote_code=True,
     )
 
-    # Prepare for LoRA training: freeze base weights, upcast norms to fp32
-    model = prepare_model_for_kbit_training(model)
-    # Disable the KV cache — not needed during training, wastes memory
+    # Allow tf32 for matmul — safe on Ampere+ and speeds up training slightly
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+    # Freeze base weights, upcast norms to fp32
+    model = prepare_model_for_kbit_training(
+        model,
+        use_gradient_checkpointing=True,    # activations recomputed → saves VRAM
+    )
+    # KV cache is incompatible with gradient checkpointing
     model.config.use_cache = False
 
     return model, tokenizer
@@ -163,11 +174,34 @@ def apply_lora(model, args: argparse.Namespace):
         lora_dropout=args.lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
-        target_modules=args.target_modules,  # only Q and V projections by default
+        target_modules=args.target_modules,
     )
     model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()  # shows how many params are actually trained
+    model.print_trainable_parameters()
     return model
+
+
+# ---------------------------------------------------------------------------
+# Adapter verification
+# ---------------------------------------------------------------------------
+def verify_adapter(output_dir: str) -> None:
+    """Confirm that the two critical adapter files exist after saving."""
+    required = ["adapter_config.json", "adapter_model.safetensors"]
+    missing = [f for f in required if not os.path.exists(os.path.join(output_dir, f))]
+    if missing:
+        # adapter_model.bin is the legacy name — accept either
+        if "adapter_model.safetensors" in missing:
+            bin_path = os.path.join(output_dir, "adapter_model.bin")
+            if os.path.exists(bin_path):
+                missing.remove("adapter_model.safetensors")
+    if missing:
+        raise RuntimeError(
+            f"Adapter save incomplete — missing files: {missing}\n"
+            f"Check {output_dir} and re-run training."
+        )
+    logger.info(f"Adapter verified: {output_dir}")
+    for f in os.listdir(output_dir):
+        logger.info(f"  {f}")
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +213,7 @@ def main() -> None:
 
     # ── WandB / console logging ───────────────────────────────────────────────
     if args.use_wandb:
-        import wandb  # noqa: F401  (checked at runtime)
+        import wandb  # noqa: F401
         os.environ.setdefault("WANDB_PROJECT", "qlora-finetuning")
         report_to = "wandb"
         logger.info("WandB logging enabled.")
@@ -196,45 +230,50 @@ def main() -> None:
     model, tokenizer = load_model_and_tokenizer(args.model_name)
     model = apply_lora(model, args)
 
-    # ── SFTConfig (replaces TrainingArguments in TRL ≥ 1.0) ──────────────────
-    # max_length is the TRL 1.0 equivalent of max_seq_length
+    # ── SFTConfig ─────────────────────────────────────────────────────────────
+    # fp16=True  / bf16=False  → mandatory for T4 (Turing architecture)
+    # gradient_checkpointing   → trades compute for VRAM
     training_args = SFTConfig(
         output_dir=args.output_dir,
         num_train_epochs=args.num_train_epochs,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        # Effective batch size = per_device_batch * gradient_accumulation_steps
         learning_rate=args.learning_rate,
-        fp16=True,                      # mixed-precision training
+        fp16=True,                          # ← float16 AMP — required for T4
+        bf16=False,                         # ← explicitly off — T4 has no bf16
+        gradient_checkpointing=True,        # ← recompute activations to save VRAM
         logging_steps=10,
         save_strategy="epoch",
-        save_total_limit=1,             # keep only the latest checkpoint
+        save_total_limit=1,
         warmup_steps=args.warmup_steps,
         report_to=report_to,
-        optim="paged_adamw_8bit",       # 8-bit paged AdamW — saves VRAM
+        optim="paged_adamw_8bit",
         lr_scheduler_type="cosine",
-        group_by_length=True,           # group similarly-lengthed samples → less padding
-        dataloader_pin_memory=False,    # avoids OOM on some systems
-        max_length=args.max_seq_length, # TRL 1.0 API: controls tokenisation truncation
+        group_by_length=True,
+        dataloader_pin_memory=False,
+        max_length=args.max_seq_length,     # TRL 1.0 API
     )
 
     # ── SFTTrainer ────────────────────────────────────────────────────────────
     trainer = SFTTrainer(
         model=model,
-        processing_class=tokenizer,     # TRL 1.0: tokenizer → processing_class
+        processing_class=tokenizer,         # TRL 1.0: processing_class replaces tokenizer
         train_dataset=dataset,
-        formatting_func=build_prompt,   # converts each sample dict → prompt string
+        formatting_func=build_prompt,
         args=training_args,
     )
 
     logger.info("Starting training...")
     trainer.train()
 
-    # ── Save ONLY the LoRA adapter (≈ a few MB, not the full 7B model) ────────
+    # ── Save ONLY the LoRA adapter (~30 MB, not the full 7B base) ─────────────
     logger.info(f"Saving LoRA adapter → {args.output_dir}")
     trainer.model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
-    logger.info("Training complete.")
+
+    # Confirm critical files landed on disk
+    verify_adapter(args.output_dir)
+    logger.info("Training finished successfully.")
 
 
 if __name__ == "__main__":
