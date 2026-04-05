@@ -252,7 +252,7 @@ def main() -> None:
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
-        fp16=True,                          # ← float16 AMP — required for T4
+        fp16=False,                          # ← float16 AMP — required for T4
         bf16=False,                         # ← explicitly off — T4 has no bf16
         gradient_checkpointing=True,        # ← recompute activations to save VRAM
         logging_steps=10,
