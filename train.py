@@ -232,6 +232,14 @@ def main() -> None:
     model, tokenizer = load_model_and_tokenizer(args.model_name)
     model = apply_lora(model, args)
 
+    # Cast all trainable (LoRA) parameters to fp16.
+    # Mistral initialises weights in bfloat16 by default; leaving LoRA params
+    # in bf16 while running fp16 AMP causes:
+    #   "_amp_foreach_non_finite_check_and_unscale_cuda not implemented for BFloat16"
+    for param in model.parameters():
+        if param.requires_grad:
+            param.data = param.data.to(torch.float16)
+
     # Explicitly enable gradient checkpointing after LoRA is applied
     model.gradient_checkpointing_enable()
 
